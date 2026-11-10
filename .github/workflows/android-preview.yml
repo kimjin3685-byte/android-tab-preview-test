@@ -38,7 +38,7 @@ jobs:
           }
           trap cleanup EXIT
           [[ "$PREVIEW_ALLOWED_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { echo 'STOP: permitted email missing or invalid'; exit 1; }
-          [[ "$PREVIEW_VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]] || { echo 'STOP: VNC password must be eight letters or digits'; exit 1; }
+          if [[ -n "$PREVIEW_VNC_PASSWORD" ]]; then echo 'PASSWORD_PRESENCE=PRESENT'; else echo 'PASSWORD_PRESENCE=ABSENT'; fi; if [[ "$PREVIEW_VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]]; then echo 'PASSWORD_FORMAT=PASS'; else echo 'PASSWORD_FORMAT=FAIL'; fi; [[ "$PREVIEW_VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]] || { echo 'STOP: VNC password must be eight letters or digits'; exit 1; }
           test -e /dev/kvm || { echo 'STOP: KVM device unavailable'; exit 1; }
           START="$(date +%s)"
           DEADLINE="$((START + 1500))"
