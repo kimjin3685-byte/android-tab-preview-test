@@ -8,7 +8,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      PREVIEW_ALLOWED_EMAIL: ${{ secrets.PREVIEW_ALLOWED_EMAIL }}
+      PREVIEW_HTTP_PASSWORD: ${{ secrets.PREVIEW_HTTP_PASSWORD }}
       PREVIEW_VNC_PASSWORD: ${{ secrets.PREVIEW_VNC_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
@@ -23,21 +23,55 @@ jobs:
           export PREVIEW_ORIGIN_FILE="$RUNNER_TEMP/preview-origin"
           export DISPLAY=:99
           cleanup() {
+            original_rc=$?
             set +e
-            adb -s emulator-5554 emu kill >/dev/null 2>&1
-            nginx -p "$T/" -c "$T/nginx.conf" -s quit >/dev/null 2>&1
+            echo "CLEANUP_BEGIN ORIGINAL_EXIT=$original_rc"
             [ -n "${CF_PID:-}" ] && kill "$CF_PID" >/dev/null 2>&1
-            [ -n "${UPLOAD_PID:-}" ] && kill "$UPLOAD_PID" >/dev/null 2>&1
-            [ -n "${UPLOAD_PID:-}" ] && wait "$UPLOAD_PID" 2>/dev/null
-            [ -n "${WS_PID:-}" ] && kill "$WS_PID" >/dev/null 2>&1
-            [ -n "${VNC_PID:-}" ] && kill "$VNC_PID" >/dev/null 2>&1
-            [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" >/dev/null 2>&1
-            [ -n "${EMU_PID:-}" ] && kill "$EMU_PID" >/dev/null 2>&1
-            rm -f "$PREVIEW_ORIGIN_FILE" "$T/vnc.pass" "$RUNNER_TEMP"/preview-*.apk
-            rm -rf "$T/body"
+            [ -f "$T/nginx.pid" ] && nginx -p "$T/" -c "$T/nginx.conf" -s stop >/dev/null 2>&1
+            command -v adb >/dev/null && timeout 10 adb -s emulator-5554 emu kill >/dev/null 2>&1
+            for pid in ${UPLOAD_PID:-} ${WS_PID:-} ${VNC_PID:-} ${XVFB_PID:-} ${EMU_PID:-}; do kill "$pid" >/dev/null 2>&1; done
+            for _ in $(seq 1 10); do
+              alive=0
+              for pid in ${CF_PID:-} ${UPLOAD_PID:-} ${WS_PID:-} ${VNC_PID:-} ${XVFB_PID:-} ${EMU_PID:-}; do kill -0 "$pid" 2>/dev/null && alive=1; done
+              [ "$alive" = 0 ] && break
+              sleep 1
+            done
+            for pid in ${CF_PID:-} ${UPLOAD_PID:-} ${WS_PID:-} ${VNC_PID:-} ${XVFB_PID:-} ${EMU_PID:-}; do
+              kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" >/dev/null 2>&1
+              wait "$pid" 2>/dev/null
+              if kill -0 "$pid" 2>/dev/null; then echo "CLEANUP_PROCESS=$pid STILL_PRESENT"; else echo "CLEANUP_PROCESS=$pid STOPPED"; fi
+            done
+            command -v adb >/dev/null && timeout 5 adb kill-server >/dev/null 2>&1
+            rm -f "$PREVIEW_ORIGIN_FILE" "$T/vnc.pass" "$T/http.pass" "$RUNNER_TEMP"/preview-*.apk
+            rm -rf "$T/body" "$T/avd"
+            python3 - "$T" "$PREVIEW_ORIGIN_FILE" <<'PY_CLEANUP'
+          import pathlib, subprocess, sys
+          root, origin = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          remaining = any(p.exists() for p in (root / "http.pass", root / "vnc.pass", root / "body", root / "avd", origin)) or any(root.parent.glob("preview-*.apk"))
+          print("CLEANUP_TEMP_FILES=" + ("REMAIN" if remaining else "REMOVED"))
+          check = subprocess.run(["ss", "-H", "-ltn"], capture_output=True, text=True)
+          ports = {"8080", "8081", "6080", "5900", "5554", "5555", "5037", "8554"}
+          listening = [line.split()[3] for line in check.stdout.splitlines() if len(line.split()) >= 4 and line.split()[3].rsplit(":", 1)[-1] in ports]
+          print("CLEANUP_PREVIEW_LISTENERS=" + ("CLOSED" if check.returncode == 0 and not listening else "UNCONFIRMED"))
+          PY_CLEANUP
+            echo "CLEANUP_END ORIGINAL_EXIT=$original_rc"
           }
           trap cleanup EXIT
-          [[ "$PREVIEW_ALLOWED_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { echo 'STOP: permitted email missing or invalid'; exit 1; }
+          trap 'exit 130' INT
+          trap 'exit 143' TERM
+          if [[ -n "$PREVIEW_HTTP_PASSWORD" ]]; then echo HTTP_PASSWORD_PRESENCE=PRESENT; else echo HTTP_PASSWORD_PRESENCE=ABSENT; fi
+          if [[ "$PREVIEW_HTTP_PASSWORD" =~ ^[A-Za-z0-9]{32,128}$ ]]; then echo HTTP_PASSWORD_FORMAT=PASS; else echo HTTP_PASSWORD_FORMAT=FAIL; exit 1; fi
+          for required in openssl python3 ss; do command -v "$required" >/dev/null || { echo "STOP: required existing program missing: $required"; exit 1; }; done
+          python3 - "$T/http.pass" <<'PY_AUTH_FILE'
+          import os, pathlib, subprocess, sys
+          result = subprocess.run(["openssl", "passwd", "-6", "-stdin"], input=os.environ["PREVIEW_HTTP_PASSWORD"] + "\n", text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          if result.returncode or not result.stdout.startswith("$6$") or len(result.stdout.splitlines()) != 1:
+              raise SystemExit("STOP: authentication file generation failed")
+          with pathlib.Path(sys.argv[1]).open("x") as output:
+              output.write("preview:" + result.stdout)
+          os.chmod(sys.argv[1], 0o600)
+          print("HTTP_AUTH_FILE=CREATED MODE=0600 USER=preview")
+          PY_AUTH_FILE
           if [[ -n "$PREVIEW_VNC_PASSWORD" ]]; then echo 'PASSWORD_PRESENCE=PRESENT'; else echo 'PASSWORD_PRESENCE=ABSENT'; fi; if [[ "$PREVIEW_VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]]; then echo 'PASSWORD_FORMAT=PASS'; else echo 'PASSWORD_FORMAT=FAIL'; fi; [[ "$PREVIEW_VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]] || { echo 'STOP: VNC password must be eight letters or digits'; exit 1; }
           test -e /dev/kvm || { echo 'STOP: KVM device unavailable'; exit 1; }
           START="$(date +%s)"
@@ -128,7 +162,7 @@ jobs:
           import base64, os, pathlib, re, sys, urllib.parse
           try:
               text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-              names = ("PREVIEW_ALLOWED_EMAIL", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+              names = ("PREVIEW_HTTP_PASSWORD", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN")
               values = [os.environ.get(name, "") for name in names]
               masks = set()
               for value in values:
@@ -209,20 +243,39 @@ jobs:
           : >"$T/origin-status.log"
           cat >"$T/nginx.conf" <<'NGINX'
           pid nginx.pid;
+          error_log /dev/null crit;
           events { worker_connections 64; }
           http {
             log_format minimal '$time_iso8601 $request_method $uri status=$status upstream_status=$upstream_status';
             access_log origin-status.log minimal;
-            error_log /dev/null crit;
             client_body_temp_path body;
+            proxy_temp_path body/proxy;
             map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+            map $http_x_forwarded_proto $external_https { default 0; https 1; }
+            map "$request_method:$http_upgrade" $need_origin { default 0; ~^POST: 1; ~^[^:]+:.+ 1; }
+            map "$need_origin:$http_origin" $bad_origin {
+              default 1;
+              ~^0: 0;
+              # PREVIEW_ORIGIN_ALLOW
+            }
             server {
               listen 127.0.0.1:8080;
+              auth_basic "Android preview";
+              auth_basic_user_file http.pass;
+              if ($external_https = 0) { return 403; }
+              if ($bad_origin) { return 403; }
               client_max_body_size 20m;
-              location = /apk { proxy_pass http://127.0.0.1:8081; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header Origin $http_origin; }
+              location = /apk {
+                proxy_pass http://127.0.0.1:8081;
+                proxy_http_version 1.1;
+                proxy_set_header Authorization "";
+                proxy_set_header Host $host;
+                proxy_set_header Origin $http_origin;
+              }
               location / {
                 proxy_pass http://127.0.0.1:6080;
                 proxy_http_version 1.1;
+                proxy_set_header Authorization "";
                 proxy_set_header Upgrade $http_upgrade;
                 proxy_set_header Connection $connection_upgrade;
                 proxy_read_timeout 1800s;
@@ -232,14 +285,49 @@ jobs:
           NGINX
           nginx -t -p "$T/" -c "$T/nginx.conf"
           nginx -p "$T/" -c "$T/nginx.conf"
-          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/vnc.html >/dev/null && curl -fsS http://127.0.0.1:8080/apk >/dev/null && break; sleep 1; done
-          curl -fsS http://127.0.0.1:8080/vnc.html >/dev/null
-          curl -fsS http://127.0.0.1:8080/apk >/dev/null
+          python3 - "$T" <<'PY_LOCAL_AUTH'
+          import base64, http.client, os, pathlib, subprocess, sys
+          root = pathlib.Path(sys.argv[1])
+          config = root.joinpath("nginx.conf").read_text()
+          expected = ['listen 127.0.0.1:8080;', 'auth_basic "Android preview";', 'auth_basic_user_file http.pass;', 'if ($external_https = 0) { return 403; }', 'if ($bad_origin) { return 403; }']
+          if not all(value in config for value in expected) or config.count('proxy_set_header Authorization "";') != 2 or 'auth_basic off' in config or 'satisfy any' in config:
+              raise SystemExit("STOP: generated authentication configuration mismatch")
+          print("NGINX_GENERATED_CONFIG_BEGIN\n" + config + "NGINX_GENERATED_CONFIG_END")
+          headers = {"X-Forwarded-Proto": "https"}
+          token = base64.b64encode(("preview:" + os.environ["PREVIEW_HTTP_PASSWORD"]).encode()).decode()
+          for path in ("/vnc.html", "/apk"):
+              for authenticated, expected_status in ((False, 401), (True, 200)):
+                  request_headers = dict(headers)
+                  if authenticated:
+                      request_headers["Authorization"] = "Basic " + token
+                  conn = http.client.HTTPConnection("127.0.0.1", 8080, timeout=10)
+                  conn.request("GET", path, headers=request_headers)
+                  response = conn.getresponse()
+                  status = response.status
+                  response.read()
+                  conn.close()
+                  print(f"LOCAL_AUTH path={path} authenticated={authenticated} status={status}")
+                  if status != expected_status:
+                      raise SystemExit("STOP: local authentication readiness failed")
+          sockets = subprocess.run(["ss", "-H", "-ltn"], capture_output=True, text=True, check=True)
+          ports = {"8080", "8081", "6080", "5900", "5554", "5555", "5037", "8554"}
+          observed = set()
+          for line in sockets.stdout.splitlines():
+              fields = line.split()
+              address = fields[3]
+              host, _, port = address.rpartition(":")
+              if port in ports:
+                  observed.add(port)
+                  if host not in ("127.0.0.1", "[::1]", "::1"):
+                      raise SystemExit("STOP: preview listener is not loopback: " + address)
+          if not {"8080", "8081", "6080", "5900", "5037"} <= observed:
+              raise SystemExit("STOP: expected preview listeners missing")
+          print("PREVIEW_LISTENERS=LOOPBACK_ONLY")
+          PY_LOCAL_AUTH
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-amd64 -o "$T/cloudflared"
           printf '%s  %s\n' '1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872' "$T/cloudflared" | sha256sum --check -
           chmod 700 "$T/cloudflared"
-          "$T/cloudflared" tunnel --help | grep -F -- '--allowed-mail' >/dev/null
-          "$T/cloudflared" tunnel --url http://127.0.0.1:8080 --allowed-mail "$PREVIEW_ALLOWED_EMAIL" >"$T/cloudflared.log" 2>&1 &
+          "$T/cloudflared" tunnel --url http://127.0.0.1:8080 >"$T/cloudflared.log" 2>&1 &
           CF_PID=$!
           echo "CLOUDFLARED_PID=$CF_PID STARTED_AT=$(date -u +%FT%TZ)"
           tunnel_log() {
@@ -248,7 +336,7 @@ jobs:
           try:
               text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
               masks = set()
-              for name in ("PREVIEW_ALLOWED_EMAIL", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+              for name in ("PREVIEW_HTTP_PASSWORD", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
                   value = os.environ.get(name, "")
                   if value:
                       masks.update((value, urllib.parse.quote(value, safe=""), base64.b64encode(value.encode()).decode()))
@@ -371,18 +459,47 @@ jobs:
           tunnel_log
           printf '%s' "$URL" >"$PREVIEW_ORIGIN_FILE"
           chmod 600 "$PREVIEW_ORIGIN_FILE"
-          BEFORE="$(wc -l <"$T/origin-status.log")"
+          python3 - "$T/nginx.conf" "$URL" <<'PY_ORIGIN'
+          import pathlib, re, sys
+          config, origin = pathlib.Path(sys.argv[1]), sys.argv[2]
+          if not re.fullmatch(r"https://[a-z0-9-]+\.trycloudflare\.com", origin):
+              raise SystemExit("STOP: unexpected preview origin")
+          text = config.read_text()
+          marker = "# PREVIEW_ORIGIN_ALLOW"
+          if text.count(marker) != 1:
+              raise SystemExit("STOP: origin configuration marker mismatch")
+          config.write_text(text.replace(marker, '"1:' + origin + '" 0;'))
+          print("NGINX_EXACT_ORIGIN_CONFIGURED")
+          print("NGINX_EFFECTIVE_CONFIG_BEGIN\n" + config.read_text() + "NGINX_EFFECTIVE_CONFIG_END")
+          PY_ORIGIN
+          nginx -t -p "$T/" -c "$T/nginx.conf"
+          python3 - "$T" <<'PY_RELOAD'
+          import pathlib, subprocess, sys, time
+          root = pathlib.Path(sys.argv[1])
+          pid = int(root.joinpath("nginx.pid").read_text())
+          children = pathlib.Path(f"/proc/{pid}/task/{pid}/children")
+          before = set(children.read_text().split())
+          subprocess.run(["nginx", "-p", str(root) + "/", "-c", str(root / "nginx.conf"), "-s", "reload"], check=True)
+          deadline = time.monotonic() + 10
+          while time.monotonic() < deadline:
+              if set(children.read_text().split()) - before:
+                  print("NGINX_RELOAD_NEW_WORKER=OBSERVED")
+                  break
+              time.sleep(0.1)
+          else:
+              raise SystemExit("STOP: Nginx reload readiness unconfirmed")
+          PY_RELOAD
           check_blocked() {
             require_cf_alive
-            if python3 -u - "$URL" "$1" "$2" "$T" <<'PY_HTTP'
+            if python3 -u - "$URL" "$1" "$2" "$T" "$3" <<'PY_HTTP'
           import base64, datetime, html, json, os, pathlib, re, subprocess, sys, urllib.parse
           from html.parser import HTMLParser
-          url, mode, path, directory = sys.argv[1:]
+          url, mode, path, directory, auth_mode = sys.argv[1:]
           folder = pathlib.Path(directory)
           def stamp():
               return datetime.datetime.now(datetime.timezone.utc).isoformat()
           def clean(text):
-              for name in ("PREVIEW_ALLOWED_EMAIL", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+              for name in ("PREVIEW_HTTP_PASSWORD", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
                   value = os.environ.get(name, "")
                   if value:
                       for variant in (value, urllib.parse.quote(value, safe=""), html.escape(value), base64.b64encode(value.encode()).decode()):
@@ -422,8 +539,13 @@ jobs:
               print("WS_REQUEST HTTP=1.1 METHOD=GET VERSION=13 NONCE_BYTES=16 FRESH_NONCE=YES", flush=True)
           elif mode == "post":
               args += ["-X", "POST", "-H", "Content-Length: 0"]
+          args += ["--http1.1", "-H", "Origin: " + url]
+          if auth_mode == "wrong":
+              args += ["-H", "Authorization: Basic " + base64.b64encode(b"preview:invalid").decode()]
+          elif auth_mode != "missing":
+              raise SystemExit("STOP: invalid authentication test mode")
           args.append(url + path)
-          print(f"HTTPS_START mode={mode} path={path} AT={stamp()}", flush=True)
+          print(f"HTTPS_START mode={mode} path={path} auth={auth_mode} AT={stamp()}", flush=True)
           try:
               response = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
               raw, error_output, curl_rc = response.stdout, response.stderr, response.returncode
@@ -440,12 +562,11 @@ jobs:
               name, colon, value = line.partition(":")
               if colon:
                   headers[name.lower().strip()] = value.strip()
-          print(f"HTTPS_END mode={mode} path={path} AT={stamp()} CURL_EXIT={curl_rc} HTTP={status}", flush=True)
+          print(f"HTTPS_END mode={mode} path={path} auth={auth_mode} AT={stamp()} CURL_EXIT={curl_rc} HTTP={status}", flush=True)
           for name in ("server", "date", "cf-ray", "content-type"):
               if name in headers:
                   emit("RESPONSE_HEADER " + name, headers[name])
-          location = headers.get("location", "")
-          blocked = frame_ok and ((status in ("301", "302", "303", "307", "308") and location.startswith("https://login.trycloudflare.com/authorize?")) or (status in ("401", "403") and "cf-ray" in headers))
+          blocked = frame_ok and status == "401" and headers.get("www-authenticate", "") == 'Basic realm="Android preview"'
           try:
               additions = {}
               for name, file in files.items():
@@ -455,13 +576,15 @@ jobs:
                       stream.seek(offsets[name])
                       additions[name] = stream.read().decode("utf-8", errors="replace")
               origin = additions["origin-status.log"].splitlines()
-              print(f"ORIGIN_LOG_READ=OK mode={mode} path={path} NEW_RECORDS={len(origin)}", flush=True)
+              print(f"ORIGIN_LOG_READ=OK mode={mode} path={path} auth={auth_mode} NEW_RECORDS={len(origin)}", flush=True)
               for line in origin:
                   emit("ORIGIN_RECORD", line)
           except OSError as error:
               emit("STOP: diagnostic read failed", type(error).__name__ + ": " + str(error))
               raise SystemExit(1)
-          if curl_rc or not blocked or origin:
+          method = "POST" if mode == "post" else "GET"
+          upstream_blocked = len(origin) == 1 and f" {method} {path} status=401 upstream_status=-" in origin[0]
+          if curl_rc or not blocked or not upstream_blocked:
               if error_output:
                   emit("CURL_ERROR", error_output.decode("utf-8", errors="replace"))
               if status == "500":
@@ -478,24 +601,24 @@ jobs:
                   print("STOP: HTTP 500으로 인증 차단 여부 판정 불가", flush=True)
               elif curl_rc:
                   print("STOP: HTTPS connection failed; authentication outcome unknown", flush=True)
-              elif origin:
-                  print("STOP: unauthenticated request reached origin", flush=True)
+              elif not upstream_blocked:
+                  print("STOP: Nginx 401 and upstream non-delivery not established", flush=True)
               else:
                   print("STOP: intended authentication block not established", flush=True)
               raise SystemExit(curl_rc if curl_rc > 0 else 1)
-          print(f"AUTH_BLOCK_CONFIRMED mode={mode} path={path} ORIGIN_RECORDS=0", flush=True)
+          print(f"AUTH_BLOCK_CONFIRMED mode={mode} path={path} auth={auth_mode} NGINX_HTTP=401 UPSTREAM=NOT_FORWARDED", flush=True)
           PY_HTTP
             then check_rc=0; else check_rc=$?; fi
             require_cf_alive
             [ "$check_rc" -eq 0 ] || exit "$check_rc"
           }
-          check_blocked http /vnc.html
-          check_blocked http /apk
-          check_blocked post /apk
-          check_blocked websocket /websockify
-          AFTER="$(wc -l <"$T/origin-status.log")"
-          [ "$AFTER" = "$BEFORE" ] || { echo 'STOP: unauthenticated request reached origin'; exit 1; }
-          echo 'UNAUTHENTICATED_HTTP_AND_WEBSOCKET_BLOCKED'
+          for auth_mode in missing wrong; do
+            check_blocked http /vnc.html "$auth_mode"
+            check_blocked http /apk "$auth_mode"
+            check_blocked post /apk "$auth_mode"
+            check_blocked websocket /websockify "$auth_mode"
+          done
+          echo 'MISSING_AND_WRONG_AUTH_HTTP_AND_WEBSOCKET_BLOCKED'
           echo "PREVIEW_URL=$URL/vnc.html?autoconnect=1"
           echo "APK_UPLOAD_URL=$URL/apk"
           REPORTED=0
