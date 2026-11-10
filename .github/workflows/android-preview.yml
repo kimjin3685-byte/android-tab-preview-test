@@ -211,7 +211,7 @@ jobs:
           pid nginx.pid;
           events { worker_connections 64; }
           http {
-            log_format minimal '$status';
+            log_format minimal '$time_iso8601 $request_method $uri status=$status upstream_status=$upstream_status';
             access_log origin-status.log minimal;
             error_log /dev/null crit;
             client_body_temp_path body;
@@ -373,25 +373,121 @@ jobs:
           chmod 600 "$PREVIEW_ORIGIN_FILE"
           BEFORE="$(wc -l <"$T/origin-status.log")"
           check_blocked() {
-            local mode="$1" path="$2" status location
-            local args=()
-            if [ "$mode" = websocket ]; then args+=(--http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='); elif [ "$mode" = post ]; then args+=(-X POST -H 'Content-Length: 0'); fi
             require_cf_alive
-            if status="$(curl -sS --max-time 12 -D "$T/check.headers" -o /dev/null -w '%{http_code}' "${args[@]}" "$URL$path")"; then
-              echo "HTTPS_REQUEST mode=$mode path=$path EXIT=0 HTTP=$status"
-            else
-              curl_rc=$?
-              echo "HTTPS_REQUEST mode=$mode path=$path EXIT=$curl_rc"
-              require_cf_alive
-              tunnel_log || true
-              exit "$curl_rc"
-            fi
+            if python3 -u - "$URL" "$1" "$2" "$T" <<'PY_HTTP'
+          import base64, datetime, html, json, os, pathlib, re, subprocess, sys, urllib.parse
+          from html.parser import HTMLParser
+          url, mode, path, directory = sys.argv[1:]
+          folder = pathlib.Path(directory)
+          def stamp():
+              return datetime.datetime.now(datetime.timezone.utc).isoformat()
+          def clean(text):
+              for name in ("PREVIEW_ALLOWED_EMAIL", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+                  value = os.environ.get(name, "")
+                  if value:
+                      for variant in (value, urllib.parse.quote(value, safe=""), html.escape(value), base64.b64encode(value.encode()).decode()):
+                          text = text.replace(variant, "[REDACTED]")
+              text = re.sub(r"(?im)^.*(?:authorization|set-cookie|cookie)\s*[:=].*$", "[REDACTED AUTH HEADER]", text)
+              text = re.sub(r'(?i)(["\x27]?(?:password|token|secret|otp|code|verification_code|api_key)["\x27]?\s*[:=]\s*)[^\s,;<>]+', r"\1[REDACTED]", text)
+              text = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[REDACTED EMAIL]", text)
+              text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[REDACTED]", text)
+              text = re.sub(r"\b[A-Za-z0-9_-]{32,}(?:\.[A-Za-z0-9_-]+)*\b|\b\d{6,8}\b", "[REDACTED VALUE]", text)
+              return text
+          def emit(label, text):
+              print(label + " " + json.dumps(clean(text), ensure_ascii=True), flush=True)
+          class BodyText(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.hidden = 0
+                  self.parts = []
+              def handle_starttag(self, tag, attrs):
+                  if tag in ("script", "style", "form"):
+                      self.hidden += 1
+              def handle_endtag(self, tag):
+                  if tag in ("script", "style", "form"):
+                      self.hidden = max(0, self.hidden - 1)
+              def handle_data(self, data):
+                  if not self.hidden:
+                      self.parts.append(data)
+          files = {name: folder / name for name in ("origin-status.log", "cloudflared.log", "websockify.log")}
+          try:
+              offsets = {name: file.stat().st_size for name, file in files.items()}
+          except OSError as error:
+              emit("STOP: diagnostic baseline unavailable", type(error).__name__ + ": " + str(error))
+              raise SystemExit(1)
+          args = ["curl", "-sS", "--max-time", "12", "--suppress-connect-headers", "-D", "-", "-o", "-", "-w", "\nDIAG_HTTP:%{http_code}\n"]
+          if mode == "websocket":
+              key = base64.b64encode(os.urandom(16)).decode("ascii")
+              args += ["--http1.1", "-H", "Connection: Upgrade", "-H", "Upgrade: websocket", "-H", "Sec-WebSocket-Version: 13", "-H", "Sec-WebSocket-Key: " + key]
+              print("WS_REQUEST HTTP=1.1 METHOD=GET VERSION=13 NONCE_BYTES=16 FRESH_NONCE=YES", flush=True)
+          elif mode == "post":
+              args += ["-X", "POST", "-H", "Content-Length: 0"]
+          args.append(url + path)
+          print(f"HTTPS_START mode={mode} path={path} AT={stamp()}", flush=True)
+          try:
+              response = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
+              raw, error_output, curl_rc = response.stdout, response.stderr, response.returncode
+          except subprocess.TimeoutExpired as error:
+              raw, error_output, curl_rc = error.stdout or b"", error.stderr or b"", 124
+          payload, separator, status_bytes = raw.rpartition(b"\nDIAG_HTTP:")
+          status = status_bytes.strip().decode("ascii", errors="replace") if separator else "UNKNOWN"
+          header_bytes, boundary, body = payload.partition(b"\r\n\r\n")
+          while re.match(rb"HTTP/\S+ 1[0-9][0-9]\b", header_bytes) and not re.match(rb"HTTP/\S+ 101\b", header_bytes):
+              header_bytes, boundary, body = body.partition(b"\r\n\r\n")
+          frame_ok = bool(boundary and re.match(rb"HTTP/\S+ [0-9]{3}\b", header_bytes) and status.isdigit())
+          headers = {}
+          for line in header_bytes.decode("iso-8859-1", errors="replace").splitlines()[1:]:
+              name, colon, value = line.partition(":")
+              if colon:
+                  headers[name.lower().strip()] = value.strip()
+          print(f"HTTPS_END mode={mode} path={path} AT={stamp()} CURL_EXIT={curl_rc} HTTP={status}", flush=True)
+          for name in ("server", "date", "cf-ray", "content-type"):
+              if name in headers:
+                  emit("RESPONSE_HEADER " + name, headers[name])
+          location = headers.get("location", "")
+          blocked = frame_ok and ((status in ("301", "302", "303", "307", "308") and location.startswith("https://login.trycloudflare.com/authorize?")) or (status in ("401", "403") and "cf-ray" in headers))
+          try:
+              additions = {}
+              for name, file in files.items():
+                  if file.stat().st_size < offsets[name]:
+                      raise OSError("diagnostic log shrank: " + name)
+                  with file.open("rb") as stream:
+                      stream.seek(offsets[name])
+                      additions[name] = stream.read().decode("utf-8", errors="replace")
+              origin = additions["origin-status.log"].splitlines()
+              print(f"ORIGIN_LOG_READ=OK mode={mode} path={path} NEW_RECORDS={len(origin)}", flush=True)
+              for line in origin:
+                  emit("ORIGIN_RECORD", line)
+          except OSError as error:
+              emit("STOP: diagnostic read failed", type(error).__name__ + ": " + str(error))
+              raise SystemExit(1)
+          if curl_rc or not blocked or origin:
+              if error_output:
+                  emit("CURL_ERROR", error_output.decode("utf-8", errors="replace"))
+              if status == "500":
+                  visible = BodyText()
+                  visible.feed(body.decode("utf-8", errors="replace"))
+                  visible_text = " ".join(visible.parts)
+                  print("HTTP_500_BODY_TRUNCATED=" + str(len(visible_text) > 8192), flush=True)
+                  emit("HTTP_500_BODY", visible_text[:8192])
+              for name in ("cloudflared.log", "websockify.log"):
+                  print(f"REQUEST_LOG_DELTA source={name} LINES={len(additions[name].splitlines())}", flush=True)
+                  for line in additions[name].splitlines():
+                      emit("REQUEST_LOG " + name, line)
+              if status == "500":
+                  print("STOP: HTTP 500으로 인증 차단 여부 판정 불가", flush=True)
+              elif curl_rc:
+                  print("STOP: HTTPS connection failed; authentication outcome unknown", flush=True)
+              elif origin:
+                  print("STOP: unauthenticated request reached origin", flush=True)
+              else:
+                  print("STOP: intended authentication block not established", flush=True)
+              raise SystemExit(curl_rc if curl_rc > 0 else 1)
+          print(f"AUTH_BLOCK_CONFIRMED mode={mode} path={path} ORIGIN_RECORDS=0", flush=True)
+          PY_HTTP
+            then check_rc=0; else check_rc=$?; fi
             require_cf_alive
-            case "$status" in
-              301|302|303|307|308) location="$(tr -d '\r' <"$T/check.headers" | sed -nE 's/^[Ll]ocation: *//p' | head -n 1)"; case "$location" in "https://login.trycloudflare.com/authorize?"*) ;; *) echo 'STOP: authentication redirect not established'; exit 1;; esac;;
-              401|403) grep -qi '^cf-ray:' "$T/check.headers" || { echo 'STOP: rejection source is unclear'; exit 1; };;
-              *) echo "STOP: unauthenticated request was not blocked; status=$status"; exit 1;;
-            esac
+            [ "$check_rc" -eq 0 ] || exit "$check_rc"
           }
           check_blocked http /vnc.html
           check_blocked http /apk
