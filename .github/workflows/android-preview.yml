@@ -43,7 +43,8 @@ jobs:
           START="$(date +%s)"
           DEADLINE="$((START + 1500))"
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc x11-utils novnc websockify nginx curl
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc x11-utils novnc websockify nginx curl libpulse0
+          python3 -c 'import ctypes; ctypes.CDLL("libpulse.so.0"); print("LIBPULSE_LOADER=PASS")'
           sudo chmod a+rw /dev/kvm
           test -r /dev/kvm && test -w /dev/kvm
           test -n "${ANDROID_HOME:-}"
