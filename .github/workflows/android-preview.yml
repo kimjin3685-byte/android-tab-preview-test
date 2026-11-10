@@ -1,0 +1,143 @@
+name: Android tab preview
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  preview:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PREVIEW_ALLOWED_EMAIL: ${{ secrets.PREVIEW_ALLOWED_EMAIL }}
+      PREVIEW_VNC_PASSWORD: ${{ secrets.PREVIEW_VNC_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start protected Android preview
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          T="$RUNNER_TEMP/android-preview"
+          mkdir -m 700 "$T"
+          mkdir -m 700 "$T/logs" "$T/body"
+          export PREVIEW_ORIGIN_FILE="$RUNNER_TEMP/preview-origin"
+          export DISPLAY=:99
+          cleanup() {
+            set +e
+            adb -s emulator-5554 emu kill >/dev/null 2>&1
+            nginx -p "$T/" -c "$T/nginx.conf" -s quit >/dev/null 2>&1
+            [ -n "${CF_PID:-}" ] && kill "$CF_PID" >/dev/null 2>&1
+            [ -n "${UPLOAD_PID:-}" ] && kill "$UPLOAD_PID" >/dev/null 2>&1
+            [ -n "${UPLOAD_PID:-}" ] && wait "$UPLOAD_PID" 2>/dev/null
+            [ -n "${WS_PID:-}" ] && kill "$WS_PID" >/dev/null 2>&1
+            [ -n "${VNC_PID:-}" ] && kill "$VNC_PID" >/dev/null 2>&1
+            [ -n "${XVFB_PID:-}" ] && kill "$XVFB_PID" >/dev/null 2>&1
+            [ -n "${EMU_PID:-}" ] && kill "$EMU_PID" >/dev/null 2>&1
+            rm -f "$PREVIEW_ORIGIN_FILE" "$T/vnc.pass" "$RUNNER_TEMP"/preview-*.apk
+            rm -rf "$T/body"
+          }
+          trap cleanup EXIT
+          [[ "$PREVIEW_ALLOWED_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || { echo 'STOP: permitted email missing or invalid'; exit 1; }
+          [[ "$PREVIEW_VNC_PASSWORD" =~ ^[A-Za-z0-9]{8}$ ]] || { echo 'STOP: VNC password must be eight letters or digits'; exit 1; }
+          test -e /dev/kvm || { echo 'STOP: KVM device unavailable'; exit 1; }
+          START="$(date +%s)"
+          DEADLINE="$((START + 1500))"
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends xvfb x11vnc x11-utils novnc websockify nginx curl
+          sudo chmod a+rw /dev/kvm
+          test -r /dev/kvm && test -w /dev/kvm
+          test -n "${ANDROID_HOME:-}"
+          SDKMAN="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          AVDMAN="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
+          test -x "$SDKMAN" && test -x "$AVDMAN"
+          sudo chown -R "$(id -u):$(id -g)" "$ANDROID_HOME"
+          timeout 360 "$SDKMAN" --install emulator platform-tools 'system-images;android-30;google_apis;x86_64' </dev/null
+          export PATH="$ANDROID_HOME/emulator:$ANDROID_HOME/platform-tools:$PATH"
+          export ANDROID_AVD_HOME="$T/avd"
+          mkdir -m 700 "$ANDROID_AVD_HOME"
+          printf 'no\n' | "$AVDMAN" create avd --name preview --package 'system-images;android-30;google_apis;x86_64' --device pixel_2
+          Xvfb :99 -screen 0 1280x800x24 >"$T/xvfb.log" 2>&1 &
+          XVFB_PID=$!
+          for _ in $(seq 1 30); do xdpyinfo -display :99 >/dev/null 2>&1 && break; sleep 1; done
+          xdpyinfo -display :99 >/dev/null
+          x11vnc -storepasswd "$PREVIEW_VNC_PASSWORD" "$T/vnc.pass" >/dev/null
+          x11vnc -display :99 -localhost -forever -shared -rfbauth "$T/vnc.pass" -rfbport 5900 >"$T/vnc.log" 2>&1 &
+          VNC_PID=$!
+          websockify --web=/usr/share/novnc 127.0.0.1:6080 127.0.0.1:5900 >"$T/websockify.log" 2>&1 &
+          WS_PID=$!
+          emulator @preview -accel on -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 -cores 2 >"$T/emulator.log" 2>&1 &
+          EMU_PID=$!
+          timeout 180 adb wait-for-device
+          timeout 600 bash -c 'until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = 1 ]; do sleep 5; done'
+          echo 'ANDROID_BOOTED; KVM_AVAILABLE'
+          python3 -u preview_upload.py >"$T/upload.log" 2>&1 &
+          UPLOAD_PID=$!
+          : >"$T/origin-status.log"
+          cat >"$T/nginx.conf" <<'NGINX'
+          pid nginx.pid;
+          events { worker_connections 64; }
+          http {
+            log_format minimal '$status';
+            access_log origin-status.log minimal;
+            error_log /dev/null crit;
+            client_body_temp_path body;
+            map $http_upgrade $connection_upgrade { default upgrade; '' close; }
+            server {
+              listen 127.0.0.1:8080;
+              client_max_body_size 20m;
+              location = /apk { proxy_pass http://127.0.0.1:8081; proxy_http_version 1.1; proxy_set_header Host $host; proxy_set_header Origin $http_origin; }
+              location / {
+                proxy_pass http://127.0.0.1:6080;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection $connection_upgrade;
+                proxy_read_timeout 1800s;
+              }
+            }
+          }
+          NGINX
+          nginx -t -p "$T/" -c "$T/nginx.conf"
+          nginx -p "$T/" -c "$T/nginx.conf"
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:8080/vnc.html >/dev/null && curl -fsS http://127.0.0.1:8080/apk >/dev/null && break; sleep 1; done
+          curl -fsS http://127.0.0.1:8080/vnc.html >/dev/null
+          curl -fsS http://127.0.0.1:8080/apk >/dev/null
+          curl -fsSL https://github.com/cloudflare/cloudflared/releases/download/2026.10.7/cloudflared-linux-amd64 -o "$T/cloudflared"
+          printf '%s  %s\n' '1f99fb518b83dec2ba8d870a7cc991d82a77e6196295a3d2754ba17ab9f91872' "$T/cloudflared" | sha256sum --check -
+          chmod 700 "$T/cloudflared"
+          "$T/cloudflared" tunnel --help | grep -F -- '--allowed-mail' >/dev/null
+          "$T/cloudflared" tunnel --url http://127.0.0.1:8080 --allowed-mail "$PREVIEW_ALLOWED_EMAIL" >"$T/cloudflared.log" 2>&1 &
+          CF_PID=$!
+          URL=''
+          for _ in $(seq 1 60); do URL="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$T/cloudflared.log" | head -n 1 || true)"; [ -n "$URL" ] && break; kill -0 "$CF_PID"; sleep 1; done
+          [ -n "$URL" ] || { echo 'STOP: protected tunnel address unavailable'; exit 1; }
+          printf '%s' "$URL" >"$PREVIEW_ORIGIN_FILE"
+          chmod 600 "$PREVIEW_ORIGIN_FILE"
+          BEFORE="$(wc -l <"$T/origin-status.log")"
+          check_blocked() {
+            local mode="$1" path="$2" status location
+            local args=()
+            if [ "$mode" = websocket ]; then args+=(--http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='); elif [ "$mode" = post ]; then args+=(-X POST -H 'Content-Length: 0'); fi
+            status="$(curl -sS --max-time 12 -D "$T/check.headers" -o /dev/null -w '%{http_code}' "${args[@]}" "$URL$path")" || { echo "STOP: unauthenticated $mode check failed"; exit 1; }
+            case "$status" in
+              301|302|303|307|308) location="$(tr -d '\r' <"$T/check.headers" | sed -nE 's/^[Ll]ocation: *//p' | head -n 1)"; case "$location" in "https://login.trycloudflare.com/authorize?"*) ;; *) echo 'STOP: authentication redirect not established'; exit 1;; esac;;
+              401|403) grep -qi '^cf-ray:' "$T/check.headers" || { echo 'STOP: rejection source is unclear'; exit 1; };;
+              *) echo "STOP: unauthenticated request was not blocked; status=$status"; exit 1;;
+            esac
+          }
+          check_blocked http /vnc.html
+          check_blocked http /apk
+          check_blocked post /apk
+          check_blocked websocket /websockify
+          AFTER="$(wc -l <"$T/origin-status.log")"
+          [ "$AFTER" = "$BEFORE" ] || { echo 'STOP: unauthenticated request reached origin'; exit 1; }
+          echo 'UNAUTHENTICATED_HTTP_AND_WEBSOCKET_BLOCKED'
+          echo "PREVIEW_URL=$URL/vnc.html?autoconnect=1"
+          echo "APK_UPLOAD_URL=$URL/apk"
+          REPORTED=0
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            if [ -e "$RUNNER_TEMP/upload-failed" ] || [ -e "$RUNNER_TEMP/upload-response-write-failed-delivery-unknown" ]; then echo 'STOP: upload outcome requires inspection'; cat "$T/upload.log"; exit 1; fi
+            if [ "$REPORTED" = 0 ] && [ -e "$RUNNER_TEMP/upload-install-ok" ] && [ -e "$RUNNER_TEMP/upload-temp-removed" ] && [ -e "$RUNNER_TEMP/upload-response-write-ok" ]; then cat "$T/upload.log"; echo 'APK_INSTALL_CONFIRMED_BY_ADB'; REPORTED=1; fi
+            kill -0 "$CF_PID" && kill -0 "$UPLOAD_PID" && kill -0 "$WS_PID" && kill -0 "$VNC_PID" && kill -0 "$XVFB_PID" && kill -0 "$EMU_PID" || { echo 'STOP: preview component exited'; exit 1; }
+            sleep 5
+          done
+          echo 'SESSION_TIME_LIMIT_REACHED'
