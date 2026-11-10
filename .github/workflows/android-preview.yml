@@ -241,9 +241,134 @@ jobs:
           "$T/cloudflared" tunnel --help | grep -F -- '--allowed-mail' >/dev/null
           "$T/cloudflared" tunnel --url http://127.0.0.1:8080 --allowed-mail "$PREVIEW_ALLOWED_EMAIL" >"$T/cloudflared.log" 2>&1 &
           CF_PID=$!
+          echo "CLOUDFLARED_PID=$CF_PID STARTED_AT=$(date -u +%FT%TZ)"
+          tunnel_log() {
+            python3 - "$T/cloudflared.log" <<'PY_CF_LOG'
+          import base64, os, pathlib, re, sys, urllib.parse
+          try:
+              text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
+              masks = set()
+              for name in ("PREVIEW_ALLOWED_EMAIL", "PREVIEW_VNC_PASSWORD", "GITHUB_TOKEN", "GH_TOKEN", "ACTIONS_RUNTIME_TOKEN", "ACTIONS_ID_TOKEN_REQUEST_TOKEN"):
+                  value = os.environ.get(name, "")
+                  if value:
+                      masks.update((value, urllib.parse.quote(value, safe=""), base64.b64encode(value.encode()).decode()))
+              for value in sorted(masks, key=len, reverse=True):
+                  text = text.replace(value, "[REDACTED]")
+              text = re.sub(r"-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----", "[REDACTED PRIVATE KEY]", text, flags=re.S)
+              text = re.sub(r"(?im)((?:authorization|cookie|set-cookie)\s*[:=]).*$", r"\1 [REDACTED]", text)
+              text = re.sub(r"(?i)((?:password|passwd|token|secret|api[_-]?key|signature)\s*[=:]\s*)[^\s,;]+", r"\1[REDACTED]", text)
+              text = re.sub(r"(https?://)[^/\s:@]+:[^@\s]+@", r"\1[REDACTED]@", text)
+              text = re.sub(r"(https?://[^\s?]+)\?[^\s]+", r"\1?[REDACTED]", text)
+              text = re.sub(r"\b(?:gh[pousr]_[A-Za-z0-9_]+|github_pat_[A-Za-z0-9_]+|(?:AKIA|ASIA)[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b", "[REDACTED]", text)
+              text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text)
+              print("TUNNEL_SANITIZED_LOG_BEGIN")
+              for line in text.splitlines():
+                  safe = "".join(c if ord(c) >= 32 and ord(c) != 127 else "\\x%02x" % ord(c) for c in line)
+                  print("TUNNEL_LOG | " + safe)
+              print("TUNNEL_SANITIZED_LOG_END")
+          except Exception:
+              print("TUNNEL_LOG_CAPTURE_FAILED")
+              sys.exit(1)
+          PY_CF_LOG
+          }
+          require_cf_alive() {
+            if ! kill -0 "$CF_PID" 2>/dev/null; then
+              if wait "$CF_PID"; then cf_rc=0; else cf_rc=$?; fi
+              echo "CLOUDFLARED_EXIT_CODE=$cf_rc DETECTED_AT=$(date -u +%FT%TZ)"
+              tunnel_log || true
+              if [ "$cf_rc" -eq 0 ]; then exit 1; else exit "$cf_rc"; fi
+            fi
+          }
           URL=''
-          for _ in $(seq 1 60); do URL="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$T/cloudflared.log" | head -n 1 || true)"; [ -n "$URL" ] && break; kill -0 "$CF_PID"; sleep 1; done
-          [ -n "$URL" ] || { echo 'STOP: protected tunnel address unavailable'; exit 1; }
+          for _ in $(seq 1 60); do require_cf_alive; URL="$(grep -Eo 'https://[a-z0-9-]+\.trycloudflare\.com' "$T/cloudflared.log" | head -n 1 || true)"; [ -n "$URL" ] && break; sleep 1; done
+          require_cf_alive
+          [ -n "$URL" ] || { echo 'STOP: protected tunnel address unavailable'; tunnel_log || true; exit 1; }
+          echo "TUNNEL_ADDRESS_EMITTED_AT=$(date -u +%FT%TZ)"
+          if timeout 120 python3 -u - "$URL" "$CF_PID" "$T/cloudflared.log" <<'PY_DNS'
+          import datetime, os, pathlib, socket, subprocess, sys, time, urllib.parse
+          host = urllib.parse.urlsplit(sys.argv[1]).hostname
+          cf_pid = int(sys.argv[2])
+          cf_log = pathlib.Path(sys.argv[3])
+          start = time.monotonic()
+          deadline = start + 120
+          def stamp():
+              return datetime.datetime.now(datetime.timezone.utc).isoformat()
+          def require_alive():
+              try:
+                  state = pathlib.Path(f"/proc/{cf_pid}/stat").read_text().rpartition(")")[2].split()[0]
+              except FileNotFoundError:
+                  state = "EXITED"
+              if state in ("Z", "X", "EXITED"):
+                  print(f"CLOUDFLARED_PROCESS=EXITED AT={stamp()}", flush=True)
+                  raise SystemExit(42)
+          query = r'''
+          import socket, sys
+          try:
+              result = socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM)
+              print("DNS_QUERY=SUCCESS ADDRESS_COUNT=" + str(len(set(r[4][0] for r in result))))
+              sys.exit(0 if result else 2)
+          except socket.gaierror as error:
+              print("DNS_QUERY=FAILED ERRNO=" + str(error.errno) + " REASON=" + str(error.strerror))
+              sys.exit(2)
+          except Exception as error:
+              print("DNS_QUERY=UNEXPECTED_ERROR TYPE=" + type(error).__name__)
+              sys.exit(1)
+          '''
+          dns_ready = False
+          for attempt in range(1, 13):
+              scheduled = start + (attempt - 1) * 10
+              while time.monotonic() < scheduled:
+                  require_alive()
+                  time.sleep(max(0, min(0.2, scheduled - time.monotonic())))
+              require_alive()
+              if time.monotonic() >= deadline:
+                  break
+              print(f"DNS_ATTEMPT={attempt} START={stamp()}", flush=True)
+              child = subprocess.Popen([sys.executable, "-c", query, host], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+              timed_out = False
+              try:
+                  query_deadline = min(deadline, time.monotonic() + 9)
+                  while child.poll() is None:
+                      require_alive()
+                      if time.monotonic() >= query_deadline:
+                          timed_out = True
+                          child.kill()
+                          break
+                      time.sleep(0.2)
+                  output, _ = child.communicate()
+              finally:
+                  if child.poll() is None:
+                      child.kill()
+                      child.wait()
+              require_alive()
+              print(f"DNS_ATTEMPT={attempt} END={stamp()} EXIT={child.returncode} TIMEOUT={timed_out}", flush=True)
+              if timed_out:
+                  print("DNS_QUERY=FAILED REASON=SYSTEM_RESOLVER_TIMEOUT", flush=True)
+              else:
+                  print(output.strip(), flush=True)
+                  if child.returncode == 0:
+                      dns_ready = True
+                      break
+                  if child.returncode != 2:
+                      raise SystemExit(child.returncode if child.returncode > 0 else 1)
+          if not dns_ready:
+              print("STOP: system DNS readiness limit reached", flush=True)
+              raise SystemExit(43)
+          while time.monotonic() < deadline:
+              require_alive()
+              if "Registered tunnel connection" in cf_log.read_text(errors="replace"):
+                  print(f"TUNNEL_REGISTRATION=OBSERVED AT={stamp()}", flush=True)
+                  print("TUNNEL_AND_SYSTEM_DNS_READY", flush=True)
+                  raise SystemExit(0)
+              time.sleep(0.2)
+          print("STOP: tunnel registration readiness limit reached", flush=True)
+          raise SystemExit(44)
+          PY_DNS
+          then ready_rc=0; else ready_rc=$?; fi
+          echo "TUNNEL_DNS_READINESS_EXIT=$ready_rc"
+          require_cf_alive
+          if [ "$ready_rc" -ne 0 ]; then tunnel_log || true; exit "$ready_rc"; fi
+          tunnel_log
           printf '%s' "$URL" >"$PREVIEW_ORIGIN_FILE"
           chmod 600 "$PREVIEW_ORIGIN_FILE"
           BEFORE="$(wc -l <"$T/origin-status.log")"
@@ -251,7 +376,17 @@ jobs:
             local mode="$1" path="$2" status location
             local args=()
             if [ "$mode" = websocket ]; then args+=(--http1.1 -H 'Connection: Upgrade' -H 'Upgrade: websocket' -H 'Sec-WebSocket-Version: 13' -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=='); elif [ "$mode" = post ]; then args+=(-X POST -H 'Content-Length: 0'); fi
-            status="$(curl -sS --max-time 12 -D "$T/check.headers" -o /dev/null -w '%{http_code}' "${args[@]}" "$URL$path")" || { echo "STOP: unauthenticated $mode check failed"; exit 1; }
+            require_cf_alive
+            if status="$(curl -sS --max-time 12 -D "$T/check.headers" -o /dev/null -w '%{http_code}' "${args[@]}" "$URL$path")"; then
+              echo "HTTPS_REQUEST mode=$mode path=$path EXIT=0 HTTP=$status"
+            else
+              curl_rc=$?
+              echo "HTTPS_REQUEST mode=$mode path=$path EXIT=$curl_rc"
+              require_cf_alive
+              tunnel_log || true
+              exit "$curl_rc"
+            fi
+            require_cf_alive
             case "$status" in
               301|302|303|307|308) location="$(tr -d '\r' <"$T/check.headers" | sed -nE 's/^[Ll]ocation: *//p' | head -n 1)"; case "$location" in "https://login.trycloudflare.com/authorize?"*) ;; *) echo 'STOP: authentication redirect not established'; exit 1;; esac;;
               401|403) grep -qi '^cf-ray:' "$T/check.headers" || { echo 'STOP: rejection source is unclear'; exit 1; };;
@@ -271,7 +406,8 @@ jobs:
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             if [ -e "$RUNNER_TEMP/upload-failed" ] || [ -e "$RUNNER_TEMP/upload-response-write-failed-delivery-unknown" ]; then echo 'STOP: upload outcome requires inspection'; cat "$T/upload.log"; exit 1; fi
             if [ "$REPORTED" = 0 ] && [ -e "$RUNNER_TEMP/upload-install-ok" ] && [ -e "$RUNNER_TEMP/upload-temp-removed" ] && [ -e "$RUNNER_TEMP/upload-response-write-ok" ]; then cat "$T/upload.log"; echo 'APK_INSTALL_CONFIRMED_BY_ADB'; REPORTED=1; fi
-            kill -0 "$CF_PID" && kill -0 "$UPLOAD_PID" && kill -0 "$WS_PID" && kill -0 "$VNC_PID" && kill -0 "$XVFB_PID" && kill -0 "$EMU_PID" || { echo 'STOP: preview component exited'; exit 1; }
+            require_cf_alive
+            kill -0 "$UPLOAD_PID" && kill -0 "$WS_PID" && kill -0 "$VNC_PID" && kill -0 "$XVFB_PID" && kill -0 "$EMU_PID" || { echo 'STOP: preview component exited'; exit 1; }
             sleep 5
           done
           echo 'SESSION_TIME_LIMIT_REACHED'
