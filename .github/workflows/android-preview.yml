@@ -67,8 +67,71 @@ jobs:
           WS_PID=$!
           emulator @preview -accel on -no-audio -no-boot-anim -no-snapshot -gpu swiftshader_indirect -memory 2048 -cores 2 >"$T/emulator.log" 2>&1 &
           EMU_PID=$!
-          timeout 180 adb wait-for-device
-          timeout 600 bash -c 'until [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = 1 ]; do sleep 5; done'
+          diag_preview() {
+            (
+              set +e
+              echo DIAG_START
+              if kill -0 "$EMU_PID" 2>/dev/null; then
+                echo EMULATOR_PROCESS=PRESENT
+                ps -p "$EMU_PID" -o pid=,stat=,comm=
+              else
+                echo EMULATOR_PROCESS=ABSENT
+              fi
+              a="$(timeout 10 adb devices 2>/dev/null)"
+              ar=$?
+              echo "ADB_DEVICES_EXIT=$ar"
+              s="$(printf '%s\n' "$a" | awk '$1=="emulator-5554" {print $2; exit}')"
+              case "$s" in
+                device|offline|unauthorized) echo "ADB_EMULATOR_STATE=$s" ;;
+                '') echo ADB_EMULATOR_STATE=NOT_LISTED ;;
+                *) echo ADB_EMULATOR_STATE=OTHER ;;
+              esac
+              for prop in sys.boot_completed dev.bootcomplete; do
+                p="$(timeout 8 adb shell getprop "$prop" 2>/dev/null)"
+                pr=$?
+                p="$(printf '%s' "$p" | tr -d '\r')"
+                case "$p" in
+                  0|1) echo "PROPERTY_$prop=$p EXIT=$pr" ;;
+                  '') echo "PROPERTY_$prop=EMPTY EXIT=$pr" ;;
+                  *) echo "PROPERTY_$prop=OTHER EXIT=$pr" ;;
+                esac
+              done
+              k="$(timeout 15 emulator -accel-check 2>&1)"
+              kr=$?
+              echo "ACCEL_CHECK_EXIT=$kr"
+              if printf '%s\n' "$k" | grep -Eqi 'not usable|not installed|not supported|permission denied|failed|unavailable'; then
+                echo ACCEL_CHECK=UNAVAILABLE_OR_ERROR
+              elif printf '%s\n' "$k" | grep -Eqi 'KVM.*installed and usable'; then
+                echo ACCEL_CHECK=KVM_USABLE
+              else
+                echo ACCEL_CHECK=OTHER
+              fi
+              echo MEMORY_MIB
+              free -m
+              echo DISK_MIB
+              df -m "$RUNNER_TEMP"
+              if [ -f "$T/emulator.log" ]; then
+                echo EMULATOR_LOG=PRESENT
+                n="$(grep -Eic 'error|fatal|panic' "$T/emulator.log")"
+                echo "EMULATOR_ERROR_FATAL_LINE_COUNT=$n"
+                n="$(grep -Eic 'kvm|accel' "$T/emulator.log")"
+                echo "EMULATOR_ACCEL_LINE_COUNT=$n"
+                grep -Eio 'kvm (is )?(available|unavailable|enabled|disabled|supported|unsupported)|kvm acceleration (enabled|disabled)|acceleration (enabled|disabled)' "$T/emulator.log" | sort -u | sed 's/^/EMULATOR_ACCEL_MATCH=/'
+                grep -Eio 'could not access kvm|kvm is not supported|failed to initialize egl|failed to initialize vulkan|out of memory|no space left on device|permission denied|segmentation fault' "$T/emulator.log" | sort -u | sed 's/^/EMULATOR_ERROR_MATCH=/'
+              else
+                echo EMULATOR_LOG=ABSENT
+              fi
+              echo DIAG_END
+            )
+          }
+          echo "ADB_WAIT_START=$(date -u +%FT%TZ)"
+          if timeout 180 adb wait-for-device; then adb_rc=0; else adb_rc=$?; fi
+          echo "ADB_WAIT_END=$(date -u +%FT%TZ) EXIT=$adb_rc"
+          if [ "$adb_rc" -ne 0 ]; then echo BOOT_WAIT=NOT_RUN; diag_preview; exit "$adb_rc"; fi
+          echo "BOOT_WAIT_START=$(date -u +%FT%TZ)"
+          if timeout 600 bash -c 'until value="$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")"; case "$value" in 0|1) printf "BOOT_SYS_COMPLETED=%s\n" "$value";; "") echo BOOT_SYS_COMPLETED=EMPTY;; *) echo BOOT_SYS_COMPLETED=OTHER;; esac; [ "$value" = 1 ]; do sleep 5; done'; then boot_rc=0; else boot_rc=$?; fi
+          echo "BOOT_WAIT_END=$(date -u +%FT%TZ) EXIT=$boot_rc"
+          if [ "$boot_rc" -ne 0 ]; then diag_preview; exit "$boot_rc"; fi
           echo 'ANDROID_BOOTED; KVM_AVAILABLE'
           python3 -u preview_upload.py >"$T/upload.log" 2>&1 &
           UPLOAD_PID=$!
