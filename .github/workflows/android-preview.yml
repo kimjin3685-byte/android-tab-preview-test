@@ -1,6 +1,12 @@
 name: Android tab preview
 on:
   workflow_dispatch:
+    inputs:
+      password_diagnostic:
+        description: 'Run password checks only (no Android or tunnel)'
+        required: true
+        type: boolean
+        default: true
 permissions:
   contents: read
 jobs:
@@ -16,6 +22,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          password_valid() { [[ "$1" =~ ^[A-Za-z0-9]{32,128}$ ]]; }
+          if [[ '${{ inputs.password_diagnostic }}' == 'true' ]]; then
+            echo PASSWORD_DIAGNOSTIC_ONLY=TRUE
+            failed=false
+            check_case() {
+              local label="$1" value="$2" expected="$3" actual=false
+              if password_valid "$value"; then actual=true; fi
+              if [[ "$actual" == "$expected" ]]; then echo "SYNTH_${label}=PASS"; else echo "SYNTH_${label}=FAIL"; failed=true; fi
+            }
+            printf -v p31 '%031d' 0
+            printf -v p32 '%032d' 0
+            printf -v p128 '%0128d' 0
+            printf -v p129 '%0129d' 0
+            check_case VALID_32 "$p32" true
+            check_case VALID_128 "$p128" true
+            check_case SHORT_31 "$p31" false
+            check_case LONG_129 "$p129" false
+            check_case SPECIAL "${p32:0:31}!" false
+            check_case NEWLINE "$p32"$'\n' false
+            if [[ -n "$PREVIEW_HTTP_PASSWORD" ]]; then echo SECRET_PRESENT=true; else echo SECRET_PRESENT=false; fi
+            if (( ${#PREVIEW_HTTP_PASSWORD} >= 32 && ${#PREVIEW_HTTP_PASSWORD} <= 128 )); then echo SECRET_LENGTH_IN_RANGE=true; else echo SECRET_LENGTH_IN_RANGE=false; fi
+            if [[ -n "$PREVIEW_HTTP_PASSWORD" && ! "$PREVIEW_HTTP_PASSWORD" =~ [^A-Za-z0-9] ]]; then echo SECRET_ALL_ASCII_ALNUM=true; else echo SECRET_ALL_ASCII_ALNUM=false; fi
+            if [[ "$PREVIEW_HTTP_PASSWORD" =~ [[:space:]] ]]; then echo SECRET_HAS_WHITESPACE=true; else echo SECRET_HAS_WHITESPACE=false; fi
+            if password_valid "$PREVIEW_HTTP_PASSWORD"; then echo SECRET_FORMAT_VALID=true; else echo SECRET_FORMAT_VALID=false; fi
+            if [[ "$failed" == true ]]; then exit 1; fi
+            exit 0
+          fi
           umask 077
           T="$RUNNER_TEMP/android-preview"
           mkdir -m 700 "$T"
@@ -60,7 +93,7 @@ jobs:
           trap 'exit 130' INT
           trap 'exit 143' TERM
           if [[ -n "$PREVIEW_HTTP_PASSWORD" ]]; then echo HTTP_PASSWORD_PRESENCE=PRESENT; else echo HTTP_PASSWORD_PRESENCE=ABSENT; fi
-          if [[ "$PREVIEW_HTTP_PASSWORD" =~ ^[A-Za-z0-9]{32,128}$ ]]; then echo HTTP_PASSWORD_FORMAT=PASS; else echo HTTP_PASSWORD_FORMAT=FAIL; exit 1; fi
+          if password_valid "$PREVIEW_HTTP_PASSWORD"; then echo HTTP_PASSWORD_FORMAT=PASS; else echo HTTP_PASSWORD_FORMAT=FAIL; exit 1; fi
           for required in openssl python3 ss; do command -v "$required" >/dev/null || { echo "STOP: required existing program missing: $required"; exit 1; }; done
           python3 - "$T/http.pass" <<'PY_AUTH_FILE'
           import os, pathlib, subprocess, sys
