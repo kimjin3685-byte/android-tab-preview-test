@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
+      PASSWORD_DIAGNOSTIC: ${{ inputs.password_diagnostic }}
       PREVIEW_HTTP_PASSWORD: ${{ secrets.PREVIEW_HTTP_PASSWORD }}
       PREVIEW_VNC_PASSWORD: ${{ secrets.PREVIEW_VNC_PASSWORD }}
     steps:
@@ -23,7 +24,8 @@ jobs:
         run: |
           set -euo pipefail
           password_valid() { [[ "$1" =~ ^[A-Za-z0-9]{32,128}$ ]]; }
-          if [[ '${{ inputs.password_diagnostic }}' == 'true' ]]; then
+          case "$PASSWORD_DIAGNOSTIC" in true|false) ;; *) echo "STOP: invalid diagnostic selection"; exit 1;; esac
+          if [[ "$PASSWORD_DIAGNOSTIC" == true ]]; then
             echo PASSWORD_DIAGNOSTIC_ONLY=TRUE
             failed=false
             check_case() {
