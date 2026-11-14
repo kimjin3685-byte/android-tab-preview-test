@@ -353,7 +353,7 @@ jobs:
               host, _, port = address.rpartition(":")
               if port in ports:
                   observed.add(port)
-                  if host not in ("127.0.0.1", "[::1]", "::1"):
+                  if host not in ("127.0.0.1", "[::1]", "::1", "[::ffff:127.0.0.1]"):
                       raise SystemExit("STOP: preview listener is not loopback: " + address)
           if not {"8080", "8081", "6080", "5900", "5037"} <= observed:
               raise SystemExit("STOP: expected preview listeners missing")
