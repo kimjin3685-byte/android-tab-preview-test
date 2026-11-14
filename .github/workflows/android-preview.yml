@@ -281,6 +281,7 @@ jobs:
           error_log /dev/null crit;
           events { worker_connections 64; }
           http {
+            map_hash_bucket_size 128;
             log_format minimal '$time_iso8601 $request_method $uri status=$status upstream_status=$upstream_status';
             access_log origin-status.log minimal;
             client_body_temp_path body;
